@@ -34,13 +34,13 @@ runs:
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp
 
         run_step "Starting warp-svc" sudo systemctl enable --now warp-svc
-        sleep 2
+        sleep 3
 
         run_step "Registering" sudo warp-cli --accept-tos registration new
         run_step "Setting proxy mode (port 40000)" sudo warp-cli --accept-tos mode proxy
         run_step "Setting proxy port" sudo warp-cli --accept-tos proxy port 40000
         run_step "Connecting" sudo warp-cli --accept-tos connect
-        sleep 2
+        sleep 5
 
         WARP_IP=$(curl -s -x socks5h://127.0.0.1:40000 \
           --connect-timeout 5 --max-time 12 --retry 3 --retry-delay 1 \
