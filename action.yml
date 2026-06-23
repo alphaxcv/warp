@@ -15,31 +15,34 @@ runs:
       run: |
         set -e
 
-        echo "Installing cloudflare-warp..."
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-        sudo apt-get update
-        sudo apt-get install -y cloudflare-warp
+        run_step() {
+          local label=$1
+          shift
+          echo ">>> $label"
+          if ! "$@" >/dev/null 2>&1; then
+            echo ">>> FAILED: $label"
+            exit 1
+          fi
+        }
 
-        # Make sure the warp daemon is running, otherwise warp-cli hangs forever
-        sudo systemctl enable --now warp-svc 2>/dev/null || (sudo warp-svc >/dev/null 2>&1 &)
-        sleep 2
+        echo ">>> Installing cloudflare-warp..."
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        sudo apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp
 
-        echo "Registering..."
-        sudo warp-cli --accept-tos registration new
+        run_step "Starting warp-svc" sudo systemctl enable --now warp-svc
+        sleep 5
 
-        # proxy mode: WARP only opens a local socks5 proxy, it does NOT touch system routing.
-        # -> runner's own traffic (incl. log upload) stays direct  => logs are LIVE.
-        # -> browser opts in via socks5://127.0.0.1:40000           => its IP exits through WARP and can rotate.
-        echo "Setting proxy mode (port 40000)..."
-        sudo warp-cli --accept-tos mode proxy
-        sudo warp-cli --accept-tos proxy port 40000
+        run_step "Registering" sudo warp-cli --accept-tos registration new
+        run_step "Setting proxy mode (port 40000)" sudo warp-cli --accept-tos mode proxy
+        run_step "Setting proxy port" sudo warp-cli --accept-tos proxy port 40000
+        run_step "Connecting" sudo warp-cli --accept-tos connect
+        sleep 8
 
-        echo "Connecting..."
-        sudo warp-cli --accept-tos connect
-        sleep 2
-
-        echo "==============================="
-        echo "WARP exit IP (browser path, via socks5 proxy):"
-        curl -s -x socks5h://127.0.0.1:40000 --connect-timeout 5 --max-time 12 --retry 3 --retry-delay 1 https://api.ipify.org || echo "N/A"
-        echo ""
+        WARP_IP=$(curl -s -x socks5h://127.0.0.1:40000 \
+          --connect-timeout 5 --max-time 12 --retry 3 --retry-delay 1 \
+          https://api.ipify.org || true)
+        echo ">>> WARP exit IP: ${WARP_IP:-N/A}"
