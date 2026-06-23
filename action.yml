@@ -1,9 +1,9 @@
 name: 'Setup WARP'
-description: '在 GitHub Actions 上安装并连接 Cloudflare WARP（普通 warp 模式，registration new 有效，IP 可轮换）'
+description: 'Install and connect Cloudflare WARP on GitHub Actions (plain warp mode, registration new works so IP can rotate)'
 
 inputs:
   stack:
-    description: 'IP 栈：ipv4 / ipv6 / dual'
+    description: 'IP stack: ipv4 / ipv6 / dual'
     required: false
     default: 'dual'
 
@@ -15,41 +15,55 @@ runs:
       run: |
         set -e
 
-        echo "===== 安装 cloudflare-warp ====="
+        echo "Installing cloudflare-warp..."
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
         sudo apt-get update
         sudo apt-get install -y cloudflare-warp
 
-        echo "===== 注册（新账号）====="
+        # Make sure the warp daemon is running, otherwise warp-cli hangs forever
+        sudo systemctl enable --now warp-svc 2>/dev/null || (sudo warp-svc >/dev/null 2>&1 &)
+        sleep 5
+
+        echo "Registering..."
         sudo warp-cli --accept-tos registration new
 
-        # 普通 warp 全隧道模式（默认即是）。按需限定 IP 栈：
         if [ "${{ inputs.stack }}" == "ipv4" ]; then
           sudo warp-cli --accept-tos tunnel ip add-range ::0/0 2>/dev/null || true
         elif [ "${{ inputs.stack }}" == "ipv6" ]; then
           sudo warp-cli --accept-tos tunnel ip add-range 0.0.0.0/0 2>/dev/null || true
         fi
 
-        echo "===== 连接（带重试）====="
+        echo "Connecting..."
         connected=0
         for attempt in $(seq 1 8); do
-          echo "connect 第 $attempt/8 次..."
+          echo "WARP connect attempt $attempt/8..."
           sudo warp-cli --accept-tos disconnect 2>/dev/null || true
           sudo warp-cli --accept-tos connect
           if timeout 30 bash -c 'until sudo warp-cli status 2>/dev/null | grep -q "Connected"; do sleep 1; done'; then
             connected=1
-            echo "WARP 已连接（第 $attempt 次）"
+            echo "WARP connected on attempt $attempt"
             break
           fi
-          echo "第 $attempt 次连接失败，重试..."
+          echo "Attempt $attempt failed, retrying..."
           sleep $((attempt * 3))
         done
         if [ $connected -ne 1 ]; then
-          echo "WARP 连接失败"
+          echo "WARP failed to connect after 8 attempts"
           exit 1
         fi
 
-        echo "===== 出口 IP ====="
-        curl -s --max-time 20 https://api.ipify.org && echo " <- WARP 出口 IP"
-        curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+        echo "==============================="
+        echo "IP:"
+        get_ip() {
+            local url_primary=$1
+            local url_backup=$2
+            local flag=$3
+            result=$(timeout 10 curl -s $flag --connect-timeout 3 --max-time 8 --retry 3 --retry-delay 1 -A Mozilla https://$url_primary 2>/dev/null)
+            if [ -z "$result" ]; then
+                result=$(timeout 10 curl -s $flag --connect-timeout 3 --max-time 8 --retry 3 --retry-delay 1 https://$url_backup 2>/dev/null)
+            fi
+            if [ -z "$result" ]; then echo "N/A"; else echo "$result"; fi
+        }
+        echo "IPv4: $(get_ip "api-ipv4.ip.sb/geoip" "speed.cloudflare.com/meta" "-4")"
+        echo "IPv6: $(get_ip "api-ipv6.ip.sb/geoip" "speed.cloudflare.com/meta" "-6")"
