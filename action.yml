@@ -42,7 +42,7 @@ runs:
         run_step "Connecting" sudo warp-cli --accept-tos connect
         sleep 5
 
-        WARP_IP=$(curl -s -x socks5h://127.0.0.1:40000 \
+        WARP_IP=$(curl -s -x socks5://127.0.0.1:40000 \
           --connect-timeout 5 --max-time 12 --retry 3 --retry-delay 1 \
           https://api.ipify.org || true)
         echo ">>> WARP exit IP: ${WARP_IP:-N/A}"
