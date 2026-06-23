@@ -35,23 +35,8 @@ runs:
         fi
 
         echo "Connecting..."
-        connected=0
-        for attempt in $(seq 1 8); do
-          echo "WARP connect attempt $attempt/8..."
-          sudo warp-cli --accept-tos disconnect 2>/dev/null || true
-          sudo warp-cli --accept-tos connect
-          if timeout 30 bash -c 'until sudo warp-cli status 2>/dev/null | grep -q "Connected"; do sleep 1; done'; then
-            connected=1
-            echo "WARP connected on attempt $attempt"
-            break
-          fi
-          echo "Attempt $attempt failed, retrying..."
-          sleep $((attempt * 3))
-        done
-        if [ $connected -ne 1 ]; then
-          echo "WARP failed to connect after 8 attempts"
-          exit 1
-        fi
+        sudo warp-cli --accept-tos connect
+        sleep 8
 
         echo "==============================="
         echo "IP:"
