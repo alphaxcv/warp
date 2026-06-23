@@ -36,6 +36,15 @@ runs:
 
         echo "Connecting..."
         sudo warp-cli --accept-tos connect
+        sleep 8
+
+        # Full-tunnel WARP breaks DNS -> runner log upload stalls (logs not live).
+        # Pin working resolvers so the runner stays responsive and logs stream live.
+        echo "Fixing DNS..."
+        sudo systemctl stop systemd-resolved 2>/dev/null || true
+        sudo systemctl disable systemd-resolved 2>/dev/null || true
+        sudo rm -f /etc/resolv.conf
+        echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf >/dev/null
         sleep 2
 
         echo "==============================="
