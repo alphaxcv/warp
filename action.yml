@@ -1,9 +1,9 @@
-name: 'Setup WARP (full tunnel, logs preserved)'
-description: 'Install Cloudflare WARP in client full-tunnel mode, but exclude the runner''s own traffic from the tunnel via an ip rule (same trick fscarmen uses) so GitHub log streaming stays LIVE. IP can rotate via "registration new".'
+name: 'Setup WARP (proxy mode)'
+description: 'Install Cloudflare WARP in proxy mode (socks5 on 127.0.0.1:40000). The runner never enters the tunnel so GitHub log streaming stays LIVE; the browser opts in via socks5 so its exit IP can rotate via "registration new".'
 
 inputs:
   stack:
-    description: 'IP stack: ipv4 / ipv6 / dual'
+    description: 'Kept for compatibility; proxy mode ignores it.'
     required: false
     default: 'dual'
 
@@ -23,40 +23,23 @@ runs:
 
         # Make sure the warp daemon is running, otherwise warp-cli hangs forever
         sudo systemctl enable --now warp-svc 2>/dev/null || (sudo warp-svc >/dev/null 2>&1 &)
-        sleep 5
-
-        # Capture the runner's real NIC IP BEFORE the tunnel comes up.
-        LAN=$(ip route get 1.1.1.1 | grep -oP 'src \K\S+' | head -1)
-        echo "Runner LAN IP: $LAN"
-        echo "$LAN" | sudo tee /tmp/warp_lan_ip >/dev/null
+        sleep 2
 
         echo "Registering..."
         sudo warp-cli --accept-tos registration new
-        # plain "warp" mode (NOT warp+doh): keeps "registration new" able to rotate the exit IP
 
-        if [ "${{ inputs.stack }}" == "ipv4" ]; then
-          sudo warp-cli --accept-tos tunnel ip add-range ::0/0 2>/dev/null || true
-        elif [ "${{ inputs.stack }}" == "ipv6" ]; then
-          sudo warp-cli --accept-tos tunnel ip add-range 0.0.0.0/0 2>/dev/null || true
-        fi
+        # proxy mode: WARP only opens a local socks5 proxy, it does NOT touch system routing.
+        # -> runner's own traffic (incl. log upload) stays direct  => logs are LIVE.
+        # -> browser opts in via socks5://127.0.0.1:40000           => its IP exits through WARP and can rotate.
+        echo "Setting proxy mode (port 40000)..."
+        sudo warp-cli --accept-tos mode proxy
+        sudo warp-cli --accept-tos proxy port 40000
 
-        echo "Connecting (full tunnel)..."
+        echo "Connecting..."
         sudo warp-cli --accept-tos connect
-        sleep 8
-
-        # KEY: keep the runner's own traffic (the GitHub log-upload agent, bound to $LAN)
-        # OUT of the WARP tunnel so logs stream live. Browser traffic is NOT sourced from
-        # $LAN, so it still goes through WARP and its IP can rotate.
-        # priority 100 = evaluated before WARP's own routing rules.
-        sudo ip -4 rule del from $LAN lookup main priority 100 2>/dev/null || true
-        sudo ip -4 rule add from $LAN lookup main priority 100
-        echo "ip rules:"
-        ip rule show | head -n 20
+        sleep 2
 
         echo "==============================="
-        echo "WARP exit IP (browser/script path, tunneled):"
-        curl -s --connect-timeout 5 --max-time 12 --retry 3 --retry-delay 1 https://api.ipify.org || echo "N/A"
-        echo ""
-        echo "Runner direct IP (log path, bypassing tunnel):"
-        curl -s --interface "$LAN" --connect-timeout 5 --max-time 12 --retry 3 --retry-delay 1 https://api.ipify.org || echo "N/A"
+        echo "WARP exit IP (browser path, via socks5 proxy):"
+        curl -s -x socks5h://127.0.0.1:40000 --connect-timeout 5 --max-time 12 --retry 3 --retry-delay 1 https://api.ipify.org || echo "N/A"
         echo ""
