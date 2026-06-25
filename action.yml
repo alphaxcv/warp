@@ -32,6 +32,8 @@ runs:
         cd /var/lib/wgcf
         wgcf generate
         cp wgcf-profile.conf /etc/wireguard/warp.conf
+        sed -i '/^DNS/d' /etc/wireguard/warp.conf
+        sed -i '/\[Interface\]/a DNS = off' /etc/wireguard/warp.conf
         sed -i '/PostUp\|PostDown/d' /etc/wireguard/warp.conf
         sed -i "/\[Interface\]/a PostDown = ip -4 rule delete from ${LAN} lookup main" /etc/wireguard/warp.conf
         sed -i "/\[Interface\]/a PostUp = ip -4 rule add from ${LAN} lookup main" /etc/wireguard/warp.conf
@@ -50,9 +52,10 @@ runs:
         set -e
         wg-quick down warp 2>/dev/null || true
         rm -f /var/lib/wgcf/wgcf-account.toml /var/lib/wgcf/wgcf-profile.conf
-        cd /var/lib/wgcf && wgcf register --accept-tos
+        cd /var/lib/wgcf && wgcf register --accept-tos >/dev/null
         warp-wg-build "$STACK"
         wg-quick up warp
+        sleep 2
         ROTATE
         sudo chmod +x /usr/local/bin/warp-rotate
 
