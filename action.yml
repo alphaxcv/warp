@@ -1,48 +1,85 @@
-name: 'Setup WARP (proxy mode)'
-description: 'Install Cloudflare WARP in proxy mode (socks5 on 127.0.0.1:40000). The runner never enters the tunnel so GitHub log streaming stays LIVE; the browser opts in via socks5 so its exit IP can rotate via "registration new".'
+name: Setup WARP
+description: Global WARP (warp-cli mode warp) + ip rule from LAN + warp-rotate
 
 inputs:
   stack:
-    description: 'Kept for compatibility; proxy mode ignores it.'
+    description: "WARP stack: ipv4, ipv6, or dual"
     required: false
-    default: 'dual'
+    default: dual
 
 runs:
   using: composite
   steps:
-    - name: Install and connect WARP
-      shell: bash
+    - shell: bash
       run: |
         set -e
+        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+        W="sudo warp-cli --accept-tos"
 
-        run_step() {
-          local label=$1
-          shift
-          echo ">>> $label"
-          if ! "$@" >/dev/null 2>&1; then
-            echo ">>> FAILED: $label"
-            exit 1
-          fi
-        }
-
-        echo ">>> Installing cloudflare-warp..."
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends curl gpg
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-          | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+          | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
           | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
         sudo apt-get update -qq
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp
+        sudo apt-get install -y --no-install-recommends cloudflare-warp iproute2
 
-        run_step "Starting warp-svc" sudo systemctl enable --now warp-svc
-        sleep 3
+        apply_stack() {
+          case "${{ inputs.stack }}" in
+            ipv4) $W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
+            ipv6) $W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
+          esac
+        }
 
-        run_step "Registering" sudo warp-cli --accept-tos registration new
-        run_step "Setting proxy mode (port 40000)" sudo warp-cli --accept-tos mode proxy
-        run_step "Setting proxy port" sudo warp-cli --accept-tos proxy port 40000
-        run_step "Connecting" sudo warp-cli --accept-tos connect
-        sleep 5
+        warp_connect() {
+          $W registration new >/dev/null 2>&1 || true
+          $W mode warp >/dev/null 2>&1
+          apply_stack
+          $W connect >/dev/null 2>&1
+          for _ in $(seq 1 30); do
+            $W status 2>/dev/null | grep -q "Connected" && return 0
+            sleep 1
+          done
+          return 1
+        }
 
-        WARP_IP=$(curl -s -x socks5h://127.0.0.1:40000 \
-          --connect-timeout 5 --max-time 12 --retry 3 --retry-delay 1 \
-          https://api.ipify.org || true)
-        echo ">>> WARP exit IP: ${WARP_IP:-N/A}"
+        LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
+        ip -4 rule add from "$LAN" lookup main 2>/dev/null || true
+
+        connected=0
+        for attempt in $(seq 1 8); do
+          $W disconnect >/dev/null 2>&1 || true
+          $W registration delete >/dev/null 2>&1 || true
+          warp_connect && connected=1 && break
+          sleep $((attempt * 2))
+        done
+        [ "$connected" -eq 1 ] || { echo "WARP connect failed"; exit 1; }
+
+        sleep 1
+        echo "IPv4: $(curl -4sm8 --retry 3 -A Mozilla https://api-ipv4.ip.sb/geoip 2>/dev/null || curl -4sm8 --retry 3 https://speed.cloudflare.com/meta 2>/dev/null || echo N/A)"
+        echo "IPv6: $(curl -6sm8 --retry 3 -A Mozilla https://api-ipv6.ip.sb/geoip 2>/dev/null || curl -6sm8 --retry 3 https://speed.cloudflare.com/meta 2>/dev/null || echo N/A)"
+
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<'ROTATE'
+        #!/bin/bash
+        set -e
+        W="warp-cli --accept-tos"
+        STACK="__STACK__"
+        $W disconnect >/dev/null 2>&1 || true
+        $W registration delete >/dev/null 2>&1 || true
+        $W registration new >/dev/null 2>&1
+        $W mode warp >/dev/null 2>&1
+        case "$STACK" in
+          ipv4) $W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
+          ipv6) $W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
+        esac
+        $W connect >/dev/null 2>&1
+        for _ in $(seq 1 30); do
+          $W status 2>/dev/null | grep -q "Connected" && exit 0
+          sleep 1
+        done
+        exit 1
+        ROTATE
+        sudo sed -i "s/__STACK__/${{ inputs.stack }}/" /usr/local/bin/warp-rotate
+        sudo sed -i 's/^[ ]\+//g' /usr/local/bin/warp-rotate
+        sudo chmod +x /usr/local/bin/warp-rotate
