@@ -1,5 +1,5 @@
 name: Setup WARP
-description: fscarmen WireGuard global + ip rule from LAN + wgcf rotate
+description: fscarmen WireGuard global + ip rule + warp-cli registration for IP rotate
 
 inputs:
   stack:
@@ -15,71 +15,85 @@ runs:
         set -e
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
         STACK="${{ inputs.stack }}"
+        W="warp-cli --accept-tos"
 
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends wireguard-tools iproute2 curl
-        curl -fsSL https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 \
-          | sudo tee /usr/local/bin/wgcf >/dev/null
-        sudo chmod +x /usr/local/bin/wgcf
-        sudo mkdir -p /var/lib/wgcf
+        sudo apt-get install -y --no-install-recommends curl gpg jq wireguard-tools iproute2
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends cloudflare-warp
+
+        reg_new() {
+          sudo systemctl start warp-svc 2>/dev/null || true
+          sleep 2
+          $W registration delete >/dev/null 2>&1 || true
+          $W registration new >/dev/null 2>&1
+          sudo systemctl stop warp-svc 2>/dev/null || true
+        }
 
         sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'B'
         #!/bin/bash
         STACK="${1:-dual}"
         LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
-        cd /var/lib/wgcf && wgcf generate >/dev/null 2>&1
-        cp wgcf-profile.conf /etc/wireguard/warp.conf
-        sed -i '/^DNS/d;/PostUp/d;/PostDown/d' /etc/wireguard/warp.conf
-        sed -i "/\[Interface\]/a DNS = off" /etc/wireguard/warp.conf
-        sed -i "/\[Interface\]/a PostDown = ip -4 rule delete from ${LAN} lookup main" /etc/wireguard/warp.conf
-        sed -i "/\[Interface\]/a PostUp = ip -4 rule add from ${LAN} lookup main" /etc/wireguard/warp.conf
-        grep -q '^MTU' /etc/wireguard/warp.conf || sed -i "/\[Interface\]/a MTU = 1280" /etc/wireguard/warp.conf
-        if [ "$STACK" = "ipv4" ]; then
-          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = 0.0.0.0/0" >> /etc/wireguard/warp.conf
-        elif [ "$STACK" = "ipv6" ]; then
-          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = ::/0" >> /etc/wireguard/warp.conf
-        fi
+        PRIV=$(jq -r '.private_key // .secret_key' /var/lib/cloudflare-warp/reg.json)
+        V4=$(jq -r '.interface.v4 // empty' /var/lib/cloudflare-warp/reg.json)
+        V6=$(jq -r '.interface.v6 // empty' /var/lib/cloudflare-warp/reg.json)
+        [ -z "$V4" ] && V4="172.16.0.2"
+        [ -z "$V6" ] && V6="2606:4700:110:0000:0000:0000:0000:0001"
+        case "$STACK" in
+          ipv4) AIPS="AllowedIPs = 0.0.0.0/0" ;;
+          ipv6) AIPS="AllowedIPs = ::/0" ;;
+          *)    AIPS="AllowedIPs = 0.0.0.0/0, ::/0" ;;
+        esac
+        tee /etc/wireguard/warp.conf >/dev/null <<EOF
+        [Interface]
+        PrivateKey = $PRIV
+        Address = ${V4}/32, ${V6}/128
+        PostUp = ip -4 rule add from $LAN lookup main
+        PostDown = ip -4 rule delete from $LAN lookup main
+        DNS = off
+        MTU = 1280
+
+        [Peer]
+        PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+        $AIPS
+        Endpoint = engage.cloudflareclient.com:2408
+        EOF
+        sed -i 's/^[ ]\+//g' /etc/wireguard/warp.conf
         B
         sudo chmod +x /usr/local/bin/warp-wg-build
 
         sudo tee /usr/local/bin/warp-rotate >/dev/null <<R
         #!/bin/bash
+        W="warp-cli --accept-tos"
         STACK="$STACK"
-        D=/var/lib/wgcf
-        get_ip() { curl -4s --connect-timeout 5 https://api.ipify.org 2>/dev/null; }
-        warp_ok() { curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)$'; }
-
-        OLD=\$(get_ip)
-        [ -f /etc/wireguard/warp.conf ] && cp /etc/wireguard/warp.conf "\$D/last.conf"
-
-        for n in 1 2 3 4 5; do
-          wg-quick down warp >/dev/null 2>&1 || true
-          rm -f "\$D/wgcf-account.toml" "\$D/wgcf-profile.conf"
-          cd "\$D" && wgcf register --accept-tos >/dev/null 2>&1 || continue
-          warp-wg-build "\$STACK" >/dev/null 2>&1 || continue
-          wg-quick up warp >/dev/null 2>&1 || continue
-          for _ in \$(seq 1 12); do
-            sleep 1
-            warp_ok || continue
-            NEW=\$(get_ip)
-            if [ -n "\$NEW" ] && { [ -z "\$OLD" ] || [ "\$NEW" != "\$OLD" ]; }; then
-              cp /etc/wireguard/warp.conf "\$D/last.conf"
-              exit 0
-            fi
-          done
+        OLD=\$(curl -4s --connect-timeout 5 https://api.ipify.org 2>/dev/null)
+        wg-quick down warp >/dev/null 2>&1 || true
+        systemctl start warp-svc >/dev/null 2>&1 || true
+        sleep 2
+        \$W registration delete >/dev/null 2>&1 || true
+        \$W registration new >/dev/null 2>&1 || exit 1
+        systemctl stop warp-svc >/dev/null 2>&1 || true
+        warp-wg-build "\$STACK" || exit 1
+        wg-quick up warp >/dev/null 2>&1 || exit 1
+        for _ in \$(seq 1 10); do
+          NEW=\$(curl -4s --connect-timeout 5 https://api.ipify.org 2>/dev/null)
+          curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)$' \
+            && [ -n "\$NEW" ] && [ "\$NEW" != "\$OLD" ] && exit 0
+          sleep 1
         done
-
-        [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
         exit 1
         R
         sudo chmod +x /usr/local/bin/warp-rotate
 
-        ok=0
-        for i in $(seq 1 5); do
-          sudo warp-rotate "$STACK" && ok=1 && break
-          sleep $((i * 2))
-        done
-        [ "$ok" -eq 1 ] || { echo "WARP failed"; exit 1; }
+        reg_new
+        sudo warp-wg-build "$STACK"
+        sudo wg-quick up warp
+        curl -4sf --connect-timeout 5 https://cloudflare.com/cdn-cgi/trace | grep -qE '^warp=(on|plus)$' \
+          || { echo "WARP failed"; exit 1; }
 
         echo "IPv4: $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
         echo "IPv6: $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
