@@ -1,9 +1,9 @@
 name: Setup WARP
-description: fscarmen WireGuard + wgcf re-register for IP rotation
+description: fscarmen WireGuard global + ip rule from LAN + wgcf rotate
 
 inputs:
   stack:
-    description: "WARP stack: ipv4, ipv6, or dual"
+    description: "ipv4, ipv6, or dual"
     required: false
     default: dual
 
@@ -15,69 +15,58 @@ runs:
         set -e
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
         STACK="${{ inputs.stack }}"
-        WGCF_DIR=/var/lib/wgcf
 
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends wireguard-tools iproute2 curl
         curl -fsSL https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 \
           | sudo tee /usr/local/bin/wgcf >/dev/null
         sudo chmod +x /usr/local/bin/wgcf
-        sudo mkdir -p "$WGCF_DIR" /etc/wireguard
+        sudo mkdir -p /var/lib/wgcf
 
-        sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'BUILD'
+        sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'B'
         #!/bin/bash
-        set -e
         STACK="${1:-dual}"
         LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
-        cd /var/lib/wgcf
-        wgcf generate >/dev/null 2>&1
+        cd /var/lib/wgcf && wgcf generate >/dev/null 2>&1
         cp wgcf-profile.conf /etc/wireguard/warp.conf
-        sed -i '/^DNS/d' /etc/wireguard/warp.conf
-        sed -i '/\[Interface\]/a DNS = off' /etc/wireguard/warp.conf
-        sed -i '/PostUp\|PostDown/d' /etc/wireguard/warp.conf
+        sed -i '/^DNS/d;/PostUp/d;/PostDown/d' /etc/wireguard/warp.conf
+        sed -i "/\[Interface\]/a DNS = off" /etc/wireguard/warp.conf
         sed -i "/\[Interface\]/a PostDown = ip -4 rule delete from ${LAN} lookup main" /etc/wireguard/warp.conf
         sed -i "/\[Interface\]/a PostUp = ip -4 rule add from ${LAN} lookup main" /etc/wireguard/warp.conf
+        grep -q '^MTU' /etc/wireguard/warp.conf || sed -i "/\[Interface\]/a MTU = 1280" /etc/wireguard/warp.conf
         if [ "$STACK" = "ipv4" ]; then
-          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf
-          echo "AllowedIPs = 0.0.0.0/0" >> /etc/wireguard/warp.conf
+          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = 0.0.0.0/0" >> /etc/wireguard/warp.conf
         elif [ "$STACK" = "ipv6" ]; then
-          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf
-          echo "AllowedIPs = ::/0" >> /etc/wireguard/warp.conf
+          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = ::/0" >> /etc/wireguard/warp.conf
         fi
-        BUILD
+        B
         sudo chmod +x /usr/local/bin/warp-wg-build
 
-        sudo tee /usr/local/bin/warp-rotate >/dev/null <<ROTATE
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<R
         #!/bin/bash
-        set -e
+        STACK="$STACK"
+        D=/var/lib/wgcf
+        [ -f /etc/wireguard/warp.conf ] && cp /etc/wireguard/warp.conf "\$D/last.conf"
         wg-quick down warp >/dev/null 2>&1 || true
-        rm -f /var/lib/wgcf/wgcf-account.toml /var/lib/wgcf/wgcf-profile.conf
-        cd /var/lib/wgcf && wgcf register --accept-tos >/dev/null 2>&1
-        warp-wg-build "$STACK" >/dev/null 2>&1
-        wg-quick up warp >/dev/null 2>&1
-        sleep 2
-        ROTATE
+        rm -f "\$D/wgcf-account.toml"
+        cd "\$D" && wgcf register --accept-tos >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
+        warp-wg-build "\$STACK" >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
+        wg-quick up warp >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
+        for _ in \$(seq 1 8); do
+          curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)$' && exit 0
+          sleep 1
+        done
+        [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
+        exit 1
+        R
         sudo chmod +x /usr/local/bin/warp-rotate
 
         ok=0
-        for attempt in $(seq 1 8); do
-          sudo wg-quick down warp 2>/dev/null || true
-          sudo rm -f "$WGCF_DIR/wgcf-account.toml" "$WGCF_DIR/wgcf-profile.conf"
-          cd "$WGCF_DIR" && sudo wgcf register --accept-tos
-          sudo warp-wg-build "$STACK"
-          sudo wg-quick up warp
-          sleep 3
-          IPV4=$(curl -4s --connect-timeout 8 https://api.ipify.org || true)
-          IPV6=$(curl -6s --connect-timeout 8 https://api64.ipify.org || true)
-          case "$STACK" in
-            ipv4) [ -n "$IPV4" ] && ok=1 ;;
-            ipv6) [ -n "$IPV6" ] && ok=1 ;;
-            *)    [ -n "$IPV4" ] && ok=1 ;;
-          esac
-          [ "$ok" -eq 1 ] && break
-          echo "attempt $attempt/8: no IP, retry..."
-          sleep $((attempt * 2))
+        for i in $(seq 1 5); do
+          sudo warp-rotate "$STACK" && ok=1 && break
+          sleep $((i * 2))
         done
-        [ "$ok" -eq 1 ] || { echo "WARP failed: no IP after 8 attempts"; exit 1; }
-        echo "IPv4: ${IPV4:-N/A}"
-        echo "IPv6: ${IPV6:-N/A}"
+        [ "$ok" -eq 1 ] || { echo "WARP failed"; exit 1; }
+
+        echo "IPv4: $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
+        echo "IPv6: $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
