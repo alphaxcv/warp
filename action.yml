@@ -1,5 +1,5 @@
 name: Setup WARP
-description: Global WARP (warp-cli mode warp) + ip rule from LAN + warp-rotate
+description: fscarmen WireGuard + wgcf re-register for IP rotation
 
 inputs:
   stack:
@@ -14,72 +14,88 @@ runs:
       run: |
         set -e
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
-        W="sudo warp-cli --accept-tos"
+        STACK="${{ inputs.stack }}"
+        WGCF_DIR=/var/lib/wgcf
 
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends curl gpg
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-          | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
-          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends cloudflare-warp iproute2
+        sudo apt-get install -y --no-install-recommends wireguard-tools iproute2 curl
+        curl -fsSL https://github.com/ViRb3/wgcf/releases/latest/download/wgcf_linux_amd64 \
+          | sudo tee /usr/local/bin/wgcf >/dev/null
+        sudo chmod +x /usr/local/bin/wgcf
+        sudo mkdir -p "$WGCF_DIR" /etc/wireguard
 
-        apply_stack() {
-          case "${{ inputs.stack }}" in
-            ipv4) $W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
-            ipv6) $W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
-          esac
-        }
-
-        warp_connect() {
-          $W registration new >/dev/null 2>&1 || true
-          $W mode warp >/dev/null 2>&1
-          apply_stack
-          $W connect >/dev/null 2>&1
-          for _ in $(seq 1 30); do
-            $W status 2>/dev/null | grep -q "Connected" && return 0
-            sleep 1
-          done
-          return 1
-        }
-
-        LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
-        ip -4 rule add from "$LAN" lookup main 2>/dev/null || true
-
-        connected=0
-        for attempt in $(seq 1 8); do
-          $W disconnect >/dev/null 2>&1 || true
-          $W registration delete >/dev/null 2>&1 || true
-          warp_connect && connected=1 && break
-          sleep $((attempt * 2))
-        done
-        [ "$connected" -eq 1 ] || { echo "WARP connect failed"; exit 1; }
-
-        sleep 1
-        echo "IPv4: $(curl -4sm8 --retry 3 -A Mozilla https://api-ipv4.ip.sb/geoip 2>/dev/null || curl -4sm8 --retry 3 https://speed.cloudflare.com/meta 2>/dev/null || echo N/A)"
-        echo "IPv6: $(curl -6sm8 --retry 3 -A Mozilla https://api-ipv6.ip.sb/geoip 2>/dev/null || curl -6sm8 --retry 3 https://speed.cloudflare.com/meta 2>/dev/null || echo N/A)"
-
-        sudo tee /usr/local/bin/warp-rotate >/dev/null <<'ROTATE'
+        sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'BUILD'
         #!/bin/bash
         set -e
-        W="warp-cli --accept-tos"
-        STACK="__STACK__"
-        $W disconnect >/dev/null 2>&1 || true
-        $W registration delete >/dev/null 2>&1 || true
-        $W registration new >/dev/null 2>&1
-        $W mode warp >/dev/null 2>&1
-        case "$STACK" in
-          ipv4) $W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
-          ipv6) $W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
-        esac
-        $W connect >/dev/null 2>&1
-        for _ in $(seq 1 30); do
-          $W status 2>/dev/null | grep -q "Connected" && exit 0
-          sleep 1
-        done
-        exit 1
+        STACK="${1:-dual}"
+        WGCF_DIR=/var/lib/wgcf
+        LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
+        cd "$WGCF_DIR"
+        wgcf generate
+        cp wgcf-profile.conf /etc/wireguard/warp.conf
+        sed -i '/PostUp\|PostDown/d' /etc/wireguard/warp.conf
+        sed -i "/\[Interface\]/a PostDown = ip -4 rule delete from ${LAN} lookup main" /etc/wireguard/warp.conf
+        sed -i "/\[Interface\]/a PostUp = ip -4 rule add from ${LAN} lookup main" /etc/wireguard/warp.conf
+        grep -q '^MTU' /etc/wireguard/warp.conf || sed -i "/\[Interface\]/a MTU = 1280" /etc/wireguard/warp.conf
+        if [ "$STACK" = "ipv4" ]; then
+          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf
+          echo "AllowedIPs = 0.0.0.0/0" >> /etc/wireguard/warp.conf
+        elif [ "$STACK" = "ipv6" ]; then
+          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf
+          echo "AllowedIPs = ::/0" >> /etc/wireguard/warp.conf
+        fi
+        BUILD
+        sudo chmod +x /usr/local/bin/warp-wg-build
+
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<ROTATE
+        #!/bin/bash
+        set -e
+        STACK="$STACK"
+        WGCF_DIR=/var/lib/wgcf
+        wg-quick down warp 2>/dev/null || true
+        rm -f "\$WGCF_DIR/wgcf-account.toml" "\$WGCF_DIR/wgcf-profile.conf"
+        cd "\$WGCF_DIR"
+        wgcf register --accept-tos
+        warp-wg-build "\$STACK"
+        wg-quick up warp
+        sleep 3
         ROTATE
-        sudo sed -i "s/__STACK__/${{ inputs.stack }}/" /usr/local/bin/warp-rotate
-        sudo sed -i 's/^[ ]\+//g' /usr/local/bin/warp-rotate
         sudo chmod +x /usr/local/bin/warp-rotate
+
+        connected=0
+        IPV4="" IPV6=""
+        for attempt in $(seq 1 8); do
+          sudo wg-quick down warp 2>/dev/null || true
+          sudo rm -f "$WGCF_DIR/wgcf-account.toml" "$WGCF_DIR/wgcf-profile.conf"
+          cd "$WGCF_DIR" && sudo wgcf register --accept-tos
+          sudo warp-wg-build "$STACK"
+          sudo wg-quick up warp || { sleep $((attempt * 2)); continue; }
+          handshake=0
+          for _ in $(seq 1 15); do
+            if sudo wg show warp latest-handshakes 2>/dev/null | grep -qE '[1-9][0-9]*'; then
+              handshake=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$handshake" -eq 1 ] || { sleep $((attempt * 2)); continue; }
+          sleep 2
+          IPV4=$(curl -4sm8 --retry 3 -A Mozilla https://api-ipv4.ip.sb/geoip 2>/dev/null \
+            || curl -4sm8 --retry 3 https://speed.cloudflare.com/meta 2>/dev/null \
+            || curl -4sf --connect-timeout 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2 \
+            || true)
+          IPV6=$(curl -6sm8 --retry 3 -A Mozilla https://api-ipv6.ip.sb/geoip 2>/dev/null \
+            || curl -6sm8 --retry 3 https://speed.cloudflare.com/meta 2>/dev/null || true)
+          case "$STACK" in
+            ipv4) [ -n "$IPV4" ] && connected=1 ;;
+            ipv6) [ -n "$IPV6" ] && connected=1 ;;
+            *)    [ -n "$IPV4" ] && connected=1 ;;
+          esac
+          [ "$connected" -eq 1 ] && break
+          echo "attempt $attempt/8: no IP yet, re-register..."
+          sleep $((attempt * 2))
+        done
+        [ "$connected" -eq 1 ] || { echo "WARP connect failed: could not get IP"; exit 1; }
+
+        echo "IPv4: ${IPV4:-N/A}"
+        echo "IPv6: ${IPV6:-N/A}"
