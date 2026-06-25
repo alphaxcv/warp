@@ -15,7 +15,8 @@ runs:
         set -e
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
         STACK="${{ inputs.stack }}"
-        W="warp-cli --accept-tos"
+        W="sudo warp-cli --accept-tos"
+        WG_PEER="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends curl gpg jq wireguard-tools iproute2
@@ -27,29 +28,40 @@ runs:
         sudo apt-get install -y --no-install-recommends cloudflare-warp
 
         reg_new() {
-          sudo systemctl start warp-svc 2>/dev/null || true
-          sleep 2
-          $W tunnel protocol set WireGuard >/dev/null 2>&1
-          $W registration delete >/dev/null 2>&1 || true
-          $W registration new >/dev/null 2>&1
-          sudo systemctl stop warp-svc 2>/dev/null || true
+          sudo systemctl enable --now warp-svc
+          sleep 3
+          $W registration delete || true
+          $W tunnel protocol set WireGuard
+          $W registration new
+          $W rotate-keys
         }
 
         sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'B'
         #!/bin/bash
+        set -e
         STACK="${1:-dual}"
         LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
-        PRIV=$(jq -r '.secret_key // empty' /var/lib/cloudflare-warp/reg.json)
-        [ ${#PRIV} -eq 44 ] || { echo "WireGuard key missing, run: warp-cli tunnel protocol set WireGuard"; exit 1; }
-        V4=$(jq -r '.interface.v4 // empty' /var/lib/cloudflare-warp/reg.json)
-        V6=$(jq -r '.interface.v6 // empty' /var/lib/cloudflare-warp/reg.json)
+        REG=/var/lib/cloudflare-warp/reg.json
+        CONF=/var/lib/cloudflare-warp/conf.json
+        WG_PEER="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+
+        PRIV=$(jq -r '.secret_key // empty' "$REG")
+        [ ${#PRIV} -eq 44 ] || { echo "reg.json: secret_key missing (need WireGuard protocol)"; exit 1; }
+        PUB=$(jq -r '.public_key // empty' "$CONF")
+        [ "$PUB" = "$WG_PEER" ] || { echo "conf.json: not WireGuard (public_key=$PUB)"; exit 1; }
+
+        V4=$(jq -r '.interface.v4 // .interface.addresses.v4 // empty' "$CONF")
+        V6=$(jq -r '.interface.v6 // .interface.addresses.v6 // empty' "$CONF")
         [ -z "$V4" ] && V4="172.16.0.2"
         [ -z "$V6" ] && V6="2606:4700:110:0000:0000:0000:0000:0001"
+        EP=$(jq -r '.endpoints[0].v4 // .endpoints[0].host // "engage.cloudflareclient.com"' "$CONF")
+
         case "$STACK" in
           ipv4) AIPS="AllowedIPs = 0.0.0.0/0" ;;
           ipv6) AIPS="AllowedIPs = ::/0" ;;
           *)    AIPS="AllowedIPs = 0.0.0.0/0, ::/0" ;;
         esac
+
         tee /etc/wireguard/warp.conf >/dev/null <<EOF
         [Interface]
         PrivateKey = $PRIV
@@ -60,9 +72,9 @@ runs:
         MTU = 1280
 
         [Peer]
-        PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+        PublicKey = $PUB
         $AIPS
-        Endpoint = engage.cloudflareclient.com:2408
+        Endpoint = ${EP}:2408
         EOF
         sed -i 's/^[ ]\+//g' /etc/wireguard/warp.conf
         B
@@ -70,18 +82,20 @@ runs:
 
         sudo tee /usr/local/bin/warp-rotate >/dev/null <<R
         #!/bin/bash
+        set -e
         W="warp-cli --accept-tos"
         STACK="$STACK"
         OLD=\$(curl -4s --connect-timeout 5 https://api.ipify.org 2>/dev/null)
         wg-quick down warp >/dev/null 2>&1 || true
-        systemctl start warp-svc >/dev/null 2>&1 || true
-        sleep 2
-        \$W tunnel protocol set WireGuard >/dev/null 2>&1
-        \$W registration delete >/dev/null 2>&1 || true
-        \$W registration new >/dev/null 2>&1 || exit 1
-        systemctl stop warp-svc >/dev/null 2>&1 || true
-        warp-wg-build "\$STACK" || exit 1
-        wg-quick up warp >/dev/null 2>&1 || exit 1
+        systemctl start warp-svc
+        sleep 3
+        \$W registration delete || true
+        \$W tunnel protocol set WireGuard
+        \$W registration new
+        \$W rotate-keys
+        systemctl stop warp-svc
+        warp-wg-build "\$STACK"
+        wg-quick up warp
         for _ in \$(seq 1 10); do
           NEW=\$(curl -4s --connect-timeout 5 https://api.ipify.org 2>/dev/null)
           curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)$' \
@@ -94,9 +108,10 @@ runs:
 
         reg_new
         sudo warp-wg-build "$STACK"
+        sudo systemctl stop warp-svc
         sudo wg-quick up warp
-        curl -4sf --connect-timeout 5 https://cloudflare.com/cdn-cgi/trace | grep -qE '^warp=(on|plus)$' \
-          || { echo "WARP failed"; exit 1; }
+        curl -4sf --connect-timeout 8 https://cloudflare.com/cdn-cgi/trace | grep -qE '^warp=(on|plus)$' \
+          || { echo "WARP trace failed"; sudo wg show warp; exit 1; }
 
         echo "IPv4: $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
         echo "IPv6: $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
