@@ -46,16 +46,29 @@ runs:
         #!/bin/bash
         STACK="$STACK"
         D=/var/lib/wgcf
+        get_ip() { curl -4s --connect-timeout 5 https://api.ipify.org 2>/dev/null; }
+        warp_ok() { curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)$'; }
+
+        OLD=\$(get_ip)
         [ -f /etc/wireguard/warp.conf ] && cp /etc/wireguard/warp.conf "\$D/last.conf"
-        wg-quick down warp >/dev/null 2>&1 || true
-        rm -f "\$D/wgcf-account.toml"
-        cd "\$D" && wgcf register --accept-tos >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
-        warp-wg-build "\$STACK" >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
-        wg-quick up warp >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
-        for _ in \$(seq 1 8); do
-          curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)$' && exit 0
-          sleep 1
+
+        for n in 1 2 3 4 5; do
+          wg-quick down warp >/dev/null 2>&1 || true
+          rm -f "\$D/wgcf-account.toml" "\$D/wgcf-profile.conf"
+          cd "\$D" && wgcf register --accept-tos >/dev/null 2>&1 || continue
+          warp-wg-build "\$STACK" >/dev/null 2>&1 || continue
+          wg-quick up warp >/dev/null 2>&1 || continue
+          for _ in \$(seq 1 12); do
+            sleep 1
+            warp_ok || continue
+            NEW=\$(get_ip)
+            if [ -n "\$NEW" ] && { [ -z "\$OLD" ] || [ "\$NEW" != "\$OLD" ]; }; then
+              cp /etc/wireguard/warp.conf "\$D/last.conf"
+              exit 0
+            fi
+          done
         done
+
         [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
         exit 1
         R
