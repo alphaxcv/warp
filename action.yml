@@ -18,12 +18,15 @@ runs:
 
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends curl gpg jq wireguard-tools iproute2
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-          | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
-          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+
+        # 1. 导入 Cloudflare 官方 GPG 密钥
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends cloudflare-warp
+
+        # 2. 关键修复：降级并锁定 warp-cli 至支持 reg.json 输出的最终稳定版
+        sudo apt-get install -y --allow-downgrades cloudflare-warp=2023.3.398.0-1
+        sudo apt-mark hold cloudflare-warp
 
         sudo tee /usr/local/bin/warp-reg >/dev/null <<'EOF'
         #!/bin/bash
@@ -39,62 +42,68 @@ runs:
 
         sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'B'
         #!/bin/bash
+        set -e # 确保 jq 解析失败时抛出异常
         STACK="${1:-dual}"
+        
+        # 3. 关键修复：在路由被 WireGuard 篡改前，精准获取物理网卡的真实出口 IP
+        MAIN_IPV4=$(ip -4 route get 8.8.8.8 | grep -oP 'src \K\S+' || true)
+        MAIN_IPV6=$(ip -6 route get 2001:4860:4860::8888 | grep -oP 'src \K\S+' || true)
+
         PRIV=$(jq -r '.secret_key' /var/lib/cloudflare-warp/reg.json)
-        [ ${#PRIV} -eq 44 ] || { echo "secret_key not WireGuard (${#PRIV} chars)" >&2; exit 1; }
+        [ ${#PRIV} -eq 44 ] || { echo "Error: secret_key not WireGuard (${#PRIV} chars)" >&2; exit 1; }
         V4=$(jq -r '.interface.v4 // "172.16.0.2"' /var/lib/cloudflare-warp/conf.json)
         V6=$(jq -r '.interface.v6 // "2606:4700:110::1"' /var/lib/cloudflare-warp/conf.json)
         EP=$(jq -r '.endpoints[0].v4 // "engage.cloudflareclient.com"' /var/lib/cloudflare-warp/conf.json)
         case "$EP" in *:*) ;; *) EP="${EP}:2408" ;; esac
+        
         case "$STACK" in
           ipv4) A="AllowedIPs = 0.0.0.0/0" ;;
           ipv6) A="AllowedIPs = ::/0" ;;
           *)    A="AllowedIPs = 0.0.0.0/0, ::/0" ;;
         esac
+
+        # 4. 关键修复：利用 PostUp/PreDown 原子级写入策略路由，避免 Runner 断网卡死
+        RULE_V4_UP="PostUp = [ -n \"$MAIN_IPV4\" ] && ip -4 rule add from $MAIN_IPV4/32 table main pref 52300 || true"
+        RULE_V4_DOWN="PreDown = [ -n \"$MAIN_IPV4\" ] && ip -4 rule del from $MAIN_IPV4/32 table main pref 52300 || true"
+        
         tee /etc/wireguard/warp.conf >/dev/null <<CFG
         [Interface]
         PrivateKey = $PRIV
         Address = ${V4}/32, ${V6}/128
-        DNS = off
         MTU = 1280
+        $RULE_V4_UP
+        $RULE_V4_DOWN
+        
         [Peer]
         PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
         $A
         Endpoint = ${EP}
         CFG
+        
+        # 移除了无效的 DNS = off (wg-quick 不支持此语法)
         sed -i 's/^[ ]\+//g' /etc/wireguard/warp.conf
         B
 
-        sudo tee /usr/local/bin/warp-rule >/dev/null <<'U'
-        #!/bin/bash
-        LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
-        ip -4 rule del from ${LAN}/32 table main 2>/dev/null || true
-        ip -4 rule add from ${LAN}/32 table main pref 52300
-        U
-
-        sudo chmod +x /usr/local/bin/warp-rule
-
-        sudo tee /usr/local/bin/warp-rotate >/dev/null <<R
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<'R'
         #!/bin/bash
         set -e
-        STACK="$STACK"
-        OLD=\$(curl -4s --connect-timeout 5 https://api.ipify.org)
+        TARGET_STACK="${1:-dual}"
+        OLD=$(curl -4s --connect-timeout 5 https://api.ipify.org || true)
         wg-quick down warp 2>/dev/null || true
         warp-reg
-        warp-wg-build "\$STACK"
+        warp-wg-build "$TARGET_STACK"
         wg-quick up warp
-        warp-rule
-        NEW=\$(curl -4s --connect-timeout 5 https://api.ipify.org)
+        NEW=$(curl -4s --connect-timeout 5 https://api.ipify.org || true)
         curl -4sf --connect-timeout 5 https://cloudflare.com/cdn-cgi/trace | grep -qE '^warp=(on|plus)$'
-        [ -n "\$NEW" ] && [ "\$NEW" != "\$OLD" ]
+        [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]
         R
 
-        sudo chmod +x /usr/local/bin/warp-reg /usr/local/bin/warp-wg-build /usr/local/bin/warp-rotate /usr/local/bin/warp-rule
+        sudo chmod +x /usr/local/bin/warp-reg /usr/local/bin/warp-wg-build /usr/local/bin/warp-rotate
 
+        # 5. 移除了独立且滞后的 warp-rule 脚本，逻辑已整合进 config
         sudo warp-reg
         sudo warp-wg-build "$STACK"
         sudo wg-quick up warp
-        sudo warp-rule
         curl -4sf --connect-timeout 5 https://cloudflare.com/cdn-cgi/trace | grep -qE '^warp=(on|plus)$'
 
         echo "IPv4: $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
