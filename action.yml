@@ -30,7 +30,7 @@ runs:
         STACK="${1:-dual}"
         LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
         cd /var/lib/wgcf
-        wgcf generate
+        wgcf generate >/dev/null 2>&1
         cp wgcf-profile.conf /etc/wireguard/warp.conf
         sed -i '/^DNS/d' /etc/wireguard/warp.conf
         sed -i '/\[Interface\]/a DNS = off' /etc/wireguard/warp.conf
@@ -50,11 +50,11 @@ runs:
         sudo tee /usr/local/bin/warp-rotate >/dev/null <<ROTATE
         #!/bin/bash
         set -e
-        wg-quick down warp 2>/dev/null || true
+        wg-quick down warp >/dev/null 2>&1 || true
         rm -f /var/lib/wgcf/wgcf-account.toml /var/lib/wgcf/wgcf-profile.conf
-        cd /var/lib/wgcf && wgcf register --accept-tos >/dev/null
-        warp-wg-build "$STACK"
-        wg-quick up warp
+        cd /var/lib/wgcf && wgcf register --accept-tos >/dev/null 2>&1
+        warp-wg-build "$STACK" >/dev/null 2>&1
+        wg-quick up warp >/dev/null 2>&1
         sleep 2
         ROTATE
         sudo chmod +x /usr/local/bin/warp-rotate
