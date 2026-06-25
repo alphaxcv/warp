@@ -46,6 +46,7 @@ runs:
         V4=$(jq -r '.interface.v4 // "172.16.0.2"' /var/lib/cloudflare-warp/conf.json)
         V6=$(jq -r '.interface.v6 // "2606:4700:110::1"' /var/lib/cloudflare-warp/conf.json)
         EP=$(jq -r '.endpoints[0].v4 // "engage.cloudflareclient.com"' /var/lib/cloudflare-warp/conf.json)
+        case "$EP" in *:*) ;; *) EP="${EP}:2408" ;; esac
         case "$STACK" in
           ipv4) A="AllowedIPs = 0.0.0.0/0" ;;
           ipv6) A="AllowedIPs = ::/0" ;;
@@ -62,7 +63,7 @@ runs:
         [Peer]
         PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
         $A
-        Endpoint = ${EP}:2408
+        Endpoint = ${EP}
         CFG
         sed -i 's/^[ ]\+//g' /etc/wireguard/warp.conf
         B
