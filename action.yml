@@ -27,11 +27,13 @@ runs:
 
         sudo tee /usr/local/bin/warp-reg >/dev/null <<'EOF'
         #!/bin/bash
+        set -e
+        W="warp-cli --accept-tos"
         systemctl start warp-svc 2>/dev/null; sleep 3
-        warp-cli --accept-tos registration delete 2>/dev/null || true
-        warp-cli --accept-tos registration new
-        warp-cli --accept-tos tunnel protocol set WireGuard
-        warp-cli --accept-tos rotate-keys
+        $W registration delete 2>/dev/null || true
+        $W registration new
+        $W tunnel protocol set WireGuard
+        $W tunnel rotate-keys
         systemctl stop warp-svc 2>/dev/null
         EOF
 
@@ -40,6 +42,7 @@ runs:
         STACK="${1:-dual}"
         LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
         PRIV=$(jq -r '.secret_key' /var/lib/cloudflare-warp/reg.json)
+        [ ${#PRIV} -eq 44 ] || { echo "secret_key not WireGuard (${#PRIV} chars)" >&2; exit 1; }
         V4=$(jq -r '.interface.v4 // "172.16.0.2"' /var/lib/cloudflare-warp/conf.json)
         V6=$(jq -r '.interface.v6 // "2606:4700:110::1"' /var/lib/cloudflare-warp/conf.json)
         EP=$(jq -r '.endpoints[0].v4 // "engage.cloudflareclient.com"' /var/lib/cloudflare-warp/conf.json)
