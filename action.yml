@@ -1,5 +1,5 @@
 name: Setup WARP
-description: fscarmen WireGuard global + ip rule from LAN + wgcf rotate
+description: WireGuard global + ip rule from LAN + wgcf rotate
 
 inputs:
   stack:
